@@ -40,6 +40,12 @@ pub(crate) const fn capabilities() -> PlatformCapabilities {
     }
 }
 
+/// macOS terminals can encode Option+special-key as ESC followed by a legacy
+/// escape sequence, so raw input keeps those doubled-ESC sequences intact.
+pub(crate) const fn preserve_doubled_escape_special_key_sequences() -> bool {
+    cfg!(target_os = "macos")
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardCommand {

@@ -146,16 +146,43 @@ impl RawInputFramer {
             })
             .collect()
     }
+
+    #[cfg(test)]
+    fn with_escape_prefix_special_key_policy(policy: EscapePrefixSpecialKeyPolicy) -> Self {
+        Self {
+            byte_framer: RawInputByteFramer::with_escape_prefix_special_key_policy(policy),
+        }
+    }
 }
 
-#[derive(Default)]
 pub(crate) struct RawInputByteFramer {
     buffer: Vec<u8>,
     discard_until: Option<ControlStringFamily>,
     discarded_tail_bytes: usize,
+    escape_prefix_special_key_policy: EscapePrefixSpecialKeyPolicy,
+}
+
+impl Default for RawInputByteFramer {
+    fn default() -> Self {
+        Self {
+            buffer: Vec::new(),
+            discard_until: None,
+            discarded_tail_bytes: 0,
+            escape_prefix_special_key_policy:
+                EscapePrefixSpecialKeyPolicy::default_for_host_platform(),
+        }
+    }
 }
 
 impl RawInputByteFramer {
+    #[cfg(test)]
+    fn with_escape_prefix_special_key_policy(policy: EscapePrefixSpecialKeyPolicy) -> Self {
+        Self {
+            escape_prefix_special_key_policy: policy,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         self.buffer.extend_from_slice(data);
         self.drain_available_chunks()
@@ -263,6 +290,12 @@ impl RawInputByteFramer {
                 continue;
             }
 
+            if self.should_split_coalesced_escape_prefix_special_sequence() {
+                chunks.push(vec![ESC]);
+                self.buffer.drain(..1);
+                continue;
+            }
+
             let Some((_event, consumed)) = extract_one_event(&self.buffer) else {
                 break;
             };
@@ -271,6 +304,32 @@ impl RawInputByteFramer {
         }
 
         chunks
+    }
+
+    fn should_split_coalesced_escape_prefix_special_sequence(&self) -> bool {
+        // On non-macOS hosts, Alt+arrows and similar special keys use modified
+        // CSI forms, so ESC + CSI/SS3 in one read is a coalesced Esc keypress
+        // followed by the next key rather than a real Alt+special-key chord.
+        self.escape_prefix_special_key_policy == EscapePrefixSpecialKeyPolicy::Split
+            && self.buffer.starts_with(b"\x1b\x1b")
+            && starts_with_special_escape_sequence(&self.buffer[1..])
+            && complete_escape_sequence_len(&self.buffer[1..]).is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EscapePrefixSpecialKeyPolicy {
+    Preserve,
+    Split,
+}
+
+impl EscapePrefixSpecialKeyPolicy {
+    fn default_for_host_platform() -> Self {
+        if crate::platform::preserve_doubled_escape_special_key_sequences() {
+            Self::Preserve
+        } else {
+            Self::Split
+        }
     }
 }
 
@@ -391,8 +450,7 @@ fn flush_incomplete_buffer(buffer: &mut Vec<u8>, tx: &mpsc::Sender<RawInputEvent
 pub(crate) fn flush_incomplete_input_bytes(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     let mut framer = RawInputByteFramer {
         buffer: std::mem::take(buffer),
-        discard_until: None,
-        discarded_tail_bytes: 0,
+        ..RawInputByteFramer::default()
     };
     let mut chunks = framer.flush_timeout();
     *buffer = framer.buffer;
@@ -595,6 +653,10 @@ fn complete_escape_sequence_len(buffer: &[u8]) -> Option<usize> {
     }
     std::str::from_utf8(&buffer[1..1 + escaped_char_width]).ok()?;
     Some(1 + escaped_char_width)
+}
+
+fn starts_with_special_escape_sequence(buffer: &[u8]) -> bool {
+    buffer.starts_with(b"\x1b[") || buffer.starts_with(b"\x1bO")
 }
 
 fn osc_string_terminator(buffer: &[u8]) -> Option<usize> {
@@ -1175,6 +1237,57 @@ mod tests {
             events.into_iter().next().unwrap(),
             KeyCode::Down,
             KeyModifiers::empty(),
+        );
+    }
+
+    #[test]
+    fn split_policy_splits_coalesced_escape_before_csi_arrow() {
+        let mut byte_framer = RawInputByteFramer::with_escape_prefix_special_key_policy(
+            EscapePrefixSpecialKeyPolicy::Split,
+        );
+        assert_eq!(
+            byte_framer.push(b"\x1b\x1b[D"),
+            vec![b"\x1b".to_vec(), b"\x1b[D".to_vec()]
+        );
+
+        let mut event_framer = RawInputFramer::with_escape_prefix_special_key_policy(
+            EscapePrefixSpecialKeyPolicy::Split,
+        );
+        let events = event_framer.push(b"\x1b\x1b[D");
+
+        assert_eq!(events.len(), 2);
+        let mut events = events.into_iter();
+        assert_raw_key(events.next().unwrap(), KeyCode::Esc, KeyModifiers::empty());
+        assert_raw_key(events.next().unwrap(), KeyCode::Left, KeyModifiers::empty());
+    }
+
+    #[test]
+    fn preserve_policy_keeps_doubled_escape_csi_arrow_as_alt_arrow() {
+        let mut framer = RawInputFramer::with_escape_prefix_special_key_policy(
+            EscapePrefixSpecialKeyPolicy::Preserve,
+        );
+        let events = framer.push(b"\x1b\x1b[D");
+
+        assert_eq!(events.len(), 1);
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Left,
+            KeyModifiers::ALT,
+        );
+    }
+
+    #[test]
+    fn split_policy_preserves_escape_prefixed_alt_char() {
+        let mut framer = RawInputFramer::with_escape_prefix_special_key_policy(
+            EscapePrefixSpecialKeyPolicy::Split,
+        );
+        let events = framer.push(b"\x1bb");
+
+        assert_eq!(events.len(), 1);
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Char('b'),
+            KeyModifiers::ALT,
         );
     }
 
