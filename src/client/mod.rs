@@ -202,6 +202,43 @@ impl ClientState {
     fn request_full_redraw(&mut self) {
         self.blit_encoder = render_ansi::BlitEncoder::new();
     }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.reported_size = (cols, rows);
+        // Resizing the host can clip or reflow cells even when consecutive
+        // resizes return to the last frame's dimensions before a frame arrives.
+        self.request_full_redraw();
+    }
+
+    fn write_semantic_frame(
+        &mut self,
+        frame: protocol::FrameData,
+        mut writer: impl io::Write,
+    ) -> io::Result<()> {
+        if (frame.width, frame.height) != (self.reported_size.0.max(1), self.reported_size.1.max(1))
+        {
+            // Frames already in transit may describe a previous window size.
+            // Do not paint them or let them consume the pending full redraw.
+            debug!(
+                frame_cols = frame.width,
+                frame_rows = frame.height,
+                terminal_cols = self.reported_size.0,
+                terminal_rows = self.reported_size.1,
+                "discarding semantic frame for stale terminal size"
+            );
+            return Ok(());
+        }
+        let encoded = self.blit_encoder.encode(&frame, false);
+        let graphics = if self.kitty_graphics_enabled {
+            frame.graphics.as_slice()
+        } else {
+            &[]
+        };
+        write_encoded_frame_with_graphics(&mut writer, &encoded.bytes, graphics)?;
+        writer.flush()?;
+        self.blit_encoder.commit(frame, encoded);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -929,7 +966,7 @@ async fn run_client_loop(
                 }
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
-                state.reported_size = (new_cols, new_rows);
+                state.resize(new_cols, new_rows);
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
                     rows: new_rows,
@@ -942,17 +979,7 @@ async fn run_client_loop(
             }
             ClientLoopEvent::ServerMessage(msg) => match msg {
                 ServerMessage::Frame(frame_data) => {
-                    let encoded = state.blit_encoder.encode(&frame_data, false);
-                    let mut stdout = io::stdout();
-                    let graphics = if state.kitty_graphics_enabled {
-                        frame_data.graphics.as_slice()
-                    } else {
-                        &[]
-                    };
-                    let _ =
-                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-                    let _ = stdout.flush();
-                    state.blit_encoder.commit(frame_data, encoded);
+                    let _ = state.write_semantic_frame(frame_data, io::stdout());
                 }
                 ServerMessage::Terminal(frame) => {
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
@@ -1403,6 +1430,131 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    fn test_client_state(cols: u16, rows: u16) -> ClientState {
+        ClientState {
+            blit_encoder: render_ansi::BlitEncoder::new(),
+            mouse_capture_active: false,
+            reported_size: (cols, rows),
+            sound_config: crate::config::SoundConfig::default(),
+            kitty_graphics_enabled: false,
+            attach_escape: None,
+            #[cfg(unix)]
+            mouse_scroll_lines: 3,
+            redraw_on_focus_gained: true,
+        }
+    }
+
+    fn test_frame(cols: u16, rows: u16) -> protocol::FrameData {
+        let mut buffer =
+            ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, cols, rows));
+        buffer[(cols - 1, rows - 1)].set_symbol("X");
+        protocol::FrameData::from_ratatui_buffer(&buffer, None)
+    }
+
+    #[test]
+    fn resize_round_trip_repaints_clipped_cells_without_an_intermediate_frame() {
+        let mut state = test_client_state(80, 24);
+        let frame = test_frame(80, 24);
+        let mut output = Vec::new();
+        state
+            .write_semantic_frame(frame.clone(), &mut output)
+            .unwrap();
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        terminal.write(b"\x1b[?1049h");
+        terminal.write(&output);
+        assert_eq!(
+            terminal.screen_graphemes(79, 23).unwrap(),
+            vec![u32::from('X')]
+        );
+
+        // A quick restore/maximize can be processed before a new server frame.
+        // The alternate screen loses cells even though the final dimensions match.
+        terminal.resize(40, 12, 0, 0).unwrap();
+        state.resize(40, 12);
+        terminal.resize(80, 24, 0, 0).unwrap();
+        state.resize(80, 24);
+        output.clear();
+        state.write_semantic_frame(frame, &mut output).unwrap();
+        terminal.write(&output);
+
+        assert_eq!(
+            terminal.screen_graphemes(79, 23).unwrap(),
+            vec![u32::from('X')]
+        );
+    }
+
+    #[test]
+    fn resize_does_not_paint_queued_frames_for_the_previous_size() {
+        let mut state = test_client_state(80, 24);
+        state
+            .write_semantic_frame(test_frame(80, 24), io::sink())
+            .unwrap();
+        state.resize(120, 40);
+        let mut output = Vec::new();
+        state
+            .write_semantic_frame(test_frame(80, 24), &mut output)
+            .unwrap();
+        assert!(
+            output.is_empty(),
+            "old geometry must not overwrite the resized screen"
+        );
+
+        state.resize(80, 24);
+        state
+            .write_semantic_frame(test_frame(120, 40), &mut output)
+            .unwrap();
+        assert!(
+            output.is_empty(),
+            "a delayed larger frame must also be discarded"
+        );
+        state
+            .write_semantic_frame(test_frame(80, 24), &mut output)
+            .unwrap();
+        assert!(
+            find_subslice(&output, b"\x1b[2J").is_some(),
+            "stale frames must not consume the full redraw"
+        );
+
+        output.clear();
+        state
+            .write_semantic_frame(test_frame(80, 24), &mut output)
+            .unwrap();
+        assert!(
+            find_subslice(&output, b"\x1b[2J").is_none(),
+            "stable geometry should resume incremental rendering"
+        );
+    }
+
+    #[test]
+    fn resize_repaints_the_new_dimensions_on_the_first_matching_frame() {
+        let mut state = test_client_state(80, 24);
+        state
+            .write_semantic_frame(test_frame(80, 24), io::sink())
+            .unwrap();
+        state.resize(120, 40);
+        let mut output = Vec::new();
+        state
+            .write_semantic_frame(test_frame(120, 40), &mut output)
+            .unwrap();
+        let mut terminal = crate::ghostty::Terminal::new(120, 40, 0).unwrap();
+        terminal.write(&output);
+        assert_eq!(
+            terminal.screen_graphemes(119, 39).unwrap(),
+            vec![u32::from('X')]
+        );
+    }
+
+    #[test]
+    fn resize_accepts_server_minimum_size_for_a_zero_sized_host() {
+        let mut state = test_client_state(80, 24);
+        state.resize(0, 0);
+        let mut output = Vec::new();
+        state
+            .write_semantic_frame(test_frame(1, 1), &mut output)
+            .unwrap();
+        assert!(output.contains(&b'X'));
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
